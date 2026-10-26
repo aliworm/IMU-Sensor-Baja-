@@ -1,0 +1,300 @@
+// ESP32 + Adafruit BNO055 tilt / steering test
+// Wiring: VIN -> 3V3, GND -> GND, SDA -> GPIO21, SCL -> GPIO22
+// Libraries: Adafruit BNO055, Adafruit Unified Sensor, Adafruit BusIO
+// Serial: 115200 baud
+//   Plotter mode  -> Tools > Serial Plotter (graphs Roll, Pitch, Steer, SteerRate)
+//   Dashboard mode -> Tools > Serial Monitor (text gauges + tilt bubble)
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+
+#define SDA_PIN      21
+#define SCL_PIN      22
+#define SAMPLE_MS    20       // 50 Hz sampling / plotting
+#define DASH_MS      250      // dashboard refresh (4 Hz)
+#define TILT_RANGE   30.0f    // +/- deg shown on tilt bars and bubble
+#define STEER_RANGE  540.0f   // +/- deg shown on steering bar (1.5 turns)
+#define RATE_RANGE   360.0f   // +/- deg/s shown on rate bar
+
+Adafruit_BNO055 bnoA(55, 0x28, &Wire);   // ADR pin low (default)
+Adafruit_BNO055 bnoB(56, 0x29, &Wire);   // ADR pin high
+Adafruit_BNO055* bno = nullptr;
+
+int outMode = 0;             // 0 = plotter, 1 = dashboard, 2 = 3D viewer stream
+bool useMag = true;          // true = NDOF (with magnetometer), false = IMUPLUS (gyro+accel only)
+
+// Orientation outputs
+float rawRoll = 0, rawPitch = 0, heading = 0;
+float roll = 0, pitch = 0;
+float rollZero = 0, pitchZero = 0;
+
+// Steering = rotation about the board's own Z axis (perpendicular to the PCB),
+// measured relative to the orientation captured when you press 'z'.
+imu::Quaternion q0;          // reference orientation
+imu::Quaternion lastQ;       // latest raw orientation (sent to the 3D viewer)
+uint8_t calSys = 0;
+float lastTwist = 0;
+float steer = 0;             // unwrapped, multi-turn, + = clockwise (viewed from chip side)
+float steerRate = 0;         // deg/s about board Z, same sign convention
+float maxLeft = 0, maxRight = 0;
+
+unsigned long lastSample = 0, lastDash = 0, rateT = 0, bootT = 0;
+uint32_t samples = 0;
+float rateHz = 0;
+bool autoZeroed = false;
+
+// ---------------------------------------------------------------------------
+
+void printHelp() {
+  Serial.println();
+  Serial.println(F("Commands (type in the input box, press Enter):"));
+  Serial.println(F("  p = plotter mode   (open Tools > Serial Plotter)"));
+  Serial.println(F("  d = dashboard mode (open Tools > Serial Monitor)"));
+  Serial.println(F("  v = 3D viewer stream (sent automatically by the viewer page)"));
+  Serial.println(F("  z = zero roll, pitch and steering at current position"));
+  Serial.println(F("  r = reset max left/right steering"));
+  Serial.println(F("  m = toggle NDOF (magnetometer) / IMUPLUS (no magnetometer)"));
+  Serial.println(F("  h = help"));
+  Serial.println();
+}
+
+void zeroAll() {
+  rollZero  = rawRoll;
+  pitchZero = rawPitch;
+  q0 = bno->getQuat();
+  lastTwist = 0;
+  steer = 0;
+  maxLeft = maxRight = 0;
+}
+
+void setFusionMode(bool mag) {
+  bno->setMode(mag ? OPERATION_MODE_NDOF : OPERATION_MODE_IMUPLUS);
+  delay(50);
+  zeroAll();
+}
+
+void readImu() {
+  imu::Vector<3> e = bno->getVector(Adafruit_BNO055::VECTOR_EULER);      // x=heading, y=roll, z=pitch
+  imu::Vector<3> g = bno->getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);  // deg/s
+  imu::Quaternion q = bno->getQuat();
+  lastQ = q;
+
+  heading  = e.x();
+  rawRoll  = e.y();
+  rawPitch = e.z();
+  roll  = rawRoll  - rollZero;
+  pitch = rawPitch - pitchZero;
+  steerRate = -g.z();
+
+  float n = q.w() * q.w() + q.x() * q.x() + q.y() * q.y() + q.z() * q.z();
+  if (n < 0.5f) return;  // fusion not producing valid data yet
+
+  // Relative rotation since zero, then the "twist" component about board Z
+  imu::Quaternion rel = q0.conjugate() * q;
+  float w = rel.w(), z = rel.z();
+  if (w < 0) { w = -w; z = -z; }
+  float twist = -2.0f * atan2f(z, w) * RAD_TO_DEG;   // -180..180
+
+  // Unwrap so the angle keeps counting past +/-180 (multi-turn steering wheel)
+  float d = twist - lastTwist;
+  if (d > 180.0f)  d -= 360.0f;
+  if (d < -180.0f) d += 360.0f;
+  steer += d;
+  lastTwist = twist;
+
+  if (steer > maxRight) maxRight = steer;
+  if (-steer > maxLeft) maxLeft = -steer;
+}
+
+// ---------------------------------------------------------------------------
+// Plotter output: "Label:value" pairs, which Arduino IDE 2 Serial Plotter graphs with a legend
+
+void printPlotter() {
+  Serial.printf("Roll:%.2f,Pitch:%.2f,Steer:%.2f,SteerRate:%.1f\n",
+                roll, pitch, steer, steerRate);
+}
+
+// 3D viewer output: Q,w,x,y,z,roll,pitch,steer,calSys
+void printViz() {
+  if (samples % 25 == 0) {
+    uint8_t s, g, a, m;
+    bno->getCalibration(&s, &g, &a, &m);
+    calSys = s;
+  }
+  Serial.printf("Q,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%u\n",
+                lastQ.w(), lastQ.x(), lastQ.y(), lastQ.z(), roll, pitch, steer, calSys);
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard helpers
+
+void makeBar(char* out, float v, float range, int half) {
+  int n = (int)lroundf(constrain(v / range, -1.0f, 1.0f) * half);
+  int k = 0;
+  out[k++] = '[';
+  for (int i = -half; i <= half; i++) {
+    char c = '-';
+    if (i == 0) c = '|';
+    else if (n > 0 && i > 0 && i <= n) c = '#';
+    else if (n < 0 && i < 0 && i >= n) c = '#';
+    out[k++] = c;
+  }
+  out[k++] = ']';
+  out[k] = '\0';
+}
+
+void makeCal(char* out, uint8_t v) {
+  for (int i = 0; i < 3; i++) out[i] = (i < v) ? '#' : '.';
+  out[3] = '\0';
+}
+
+void drawBubble() {
+  const int R = 11, C = 31;
+  const int cr = R / 2, cc = C / 2;
+  int br = cr - (int)lroundf(constrain(pitch / TILT_RANGE, -1.0f, 1.0f) * cr);
+  int bc = cc + (int)lroundf(constrain(roll  / TILT_RANGE, -1.0f, 1.0f) * cc);
+
+  char line[C + 12];
+  int k = 0;
+  for (int i = 0; i < 9; i++) line[k++] = ' ';
+  line[k++] = '+';
+  for (int c = 0; c < C; c++) line[k++] = '-';
+  line[k++] = '+';
+  line[k] = '\0';
+  Serial.println(line);
+
+  for (int r = 0; r < R; r++) {
+    k = 0;
+    const char* lbl = (r == 0) ? " +pitch  " : (r == R - 1) ? " -pitch  " : "         ";
+    for (int i = 0; i < 9; i++) line[k++] = lbl[i];
+    line[k++] = '|';
+    for (int c = 0; c < C; c++) {
+      char ch = ' ';
+      if (r == cr && c == cc) ch = '+';
+      else if (r == cr) ch = '-';
+      else if (c == cc) ch = ':';
+      if (r == br && c == bc) ch = 'O';
+      line[k++] = ch;
+    }
+    line[k++] = '|';
+    line[k] = '\0';
+    Serial.println(line);
+  }
+
+  k = 0;
+  for (int i = 0; i < 9; i++) line[k++] = ' ';
+  line[k++] = '+';
+  for (int c = 0; c < C; c++) line[k++] = '-';
+  line[k++] = '+';
+  line[k] = '\0';
+  Serial.println(line);
+  Serial.println(F("          -roll                          +roll"));
+}
+
+void drawDashboard() {
+  uint8_t cs, cg, ca, cm;
+  bno->getCalibration(&cs, &cg, &ca, &cm);
+  char c1[4], c2[4], c3[4], c4[4], bar[64];
+  makeCal(c1, cs); makeCal(c2, cg); makeCal(c3, ca); makeCal(c4, cm);
+
+  Serial.println();
+  Serial.println();
+  Serial.println(F("================= BNO055  TILT / STEERING ================="));
+  Serial.printf(" Mode: %-7s   Rate: %3.0f Hz   Heading(raw): %6.1f deg\n",
+                useMag ? "NDOF" : "IMUPLUS", rateHz, heading);
+  Serial.printf(" Calib  SYS[%s] GYR[%s] ACC[%s] MAG[%s]   (### = good)\n", c1, c2, c3, c4);
+  Serial.println(F("-----------------------------------------------------------"));
+
+  makeBar(bar, roll, TILT_RANGE, 15);
+  Serial.printf(" ROLL   %+7.1f deg   - %s +\n", roll, bar);
+  makeBar(bar, pitch, TILT_RANGE, 15);
+  Serial.printf(" PITCH  %+7.1f deg   - %s +\n", pitch, bar);
+  makeBar(bar, steer, STEER_RANGE, 15);
+  Serial.printf(" STEER  %+7.1f deg   L %s R  %+.2f turns\n", steer, bar, steer / 360.0f);
+  makeBar(bar, steerRate, RATE_RANGE, 15);
+  Serial.printf(" RATE   %+7.1f d/s   L %s R\n", steerRate, bar);
+  Serial.printf(" Max steer   L: %.1f   R: %.1f   Lock-to-lock: %.1f deg\n",
+                maxLeft, maxRight, maxLeft + maxRight);
+  Serial.println();
+  Serial.println(F("              Tilt bubble (+/-30 deg)"));
+  drawBubble();
+}
+
+// ---------------------------------------------------------------------------
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = tolower(Serial.read());
+    switch (c) {
+      case 'p': outMode = 0; Serial.println(F("# Plotter mode")); break;
+      case 'd': outMode = 1; Serial.println(F("# Dashboard mode")); break;
+      case 'v': outMode = 2; break;
+      case 'z': zeroAll();         Serial.println(F("# Zeroed")); break;
+      case 'r': maxLeft = maxRight = 0; Serial.println(F("# Max reset")); break;
+      case 'm':
+        useMag = !useMag;
+        setFusionMode(useMag);
+        Serial.println(useMag ? F("# NDOF (mag on), re-zeroed") : F("# IMUPLUS (mag off), re-zeroed"));
+        break;
+      case 'h': printHelp(); break;
+      default: break;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println(F("\nESP32 + BNO055 tilt/steering test"));
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  if (bnoA.begin())      bno = &bnoA;
+  else if (bnoB.begin()) bno = &bnoB;
+
+  if (!bno) {
+    while (true) {
+      Serial.println(F("BNO055 not found at 0x28 or 0x29. Check VIN->3V3, GND->GND, SDA->21, SCL->22."));
+      delay(1000);
+    }
+  }
+
+  Serial.printf("BNO055 found at 0x%02X\n", (bno == &bnoA) ? 0x28 : 0x29);
+  delay(1000);
+  bno->setExtCrystalUse(true);
+
+  printHelp();
+  bootT = rateT = millis();
+}
+
+void loop() {
+  handleSerial();
+  unsigned long now = millis();
+
+  if (now - lastSample >= SAMPLE_MS) {
+    lastSample = now;
+    readImu();
+    samples++;
+    if (outMode == 0) printPlotter();
+    else if (outMode == 2) printViz();
+  }
+
+  if (!autoZeroed && now - bootT > 1500) {
+    zeroAll();
+    autoZeroed = true;
+  }
+
+  if (now - rateT >= 1000) {
+    rateHz = samples * 1000.0f / (now - rateT);
+    samples = 0;
+    rateT = now;
+  }
+
+  if (outMode == 1 && now - lastDash >= DASH_MS) {
+    lastDash = now;
+    drawDashboard();
+  }
+}
