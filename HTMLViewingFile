@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baja IMU Viewer</title>
+<style>
+  :root {
+    --bg1: #0d1726;
+    --bg2: #1b2b44;
+    --panel: rgba(12, 20, 34, 0.82);
+    --line: rgba(255, 255, 255, 0.12);
+    --text: #e8eef7;
+    --muted: #93a4bd;
+    --accent: #ff5f05;
+    --good: #3ccf7a;
+    --warn: #f5c542;
+    --bad: #ff5a5a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body {
+    background: radial-gradient(ellipse at 50% 30%, var(--bg2), var(--bg1));
+    color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #view { position: fixed; inset: 0; }
+  .panel {
+    position: fixed;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    backdrop-filter: blur(6px);
+  }
+  #controls { top: 16px; left: 16px; width: 280px; max-height: calc(100% - 32px); overflow-y: auto; }
+  #hud { top: 16px; right: 16px; width: 230px; }
+  h1 { font-size: 16px; margin: 0 0 2px; letter-spacing: 0.3px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+  button {
+    flex: 1;
+    background: #22344f;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { background: #2b4264; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.on { outline: 2px solid var(--accent); }
+  label { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 4px; }
+  select, input[type=file] {
+    width: 100%;
+    background: #15233a;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 8px;
+    font: inherit;
+  }
+  input[type=color] { width: 100%; height: 32px; border: 1px solid var(--line); border-radius: 8px; background: #15233a; }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-top: 6px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); flex: none; }
+  .dot.ok { background: var(--good); }
+  .dot.wait { background: var(--warn); }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+  .note { color: var(--muted); font-size: 12px; }
+  .metric { display: flex; justify-content: space-between; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); }
+  .metric:last-child { border-bottom: 0; }
+  .metric .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; }
+  .metric .v { font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; }
+  .metric .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .cal { display: flex; gap: 4px; }
+  .cal i { width: 14px; height: 8px; border-radius: 3px; background: #2a3a55; display: block; }
+  .cal i.f { background: var(--good); }
+  #warn { color: var(--warn); font-size: 12px; display: none; margin-top: 8px; }
+  @media (max-width: 640px) {
+    #controls { width: auto; right: 16px; max-height: 45%; }
+    #hud { top: auto; bottom: 16px; left: 16px; width: auto; }
+  }
+</style>
+</head>
+<body>
+<div id="view"></div>
+
+<div id="controls" class="panel">
+  <h1>Baja <span>IMU</span> Viewer</h1>
+  <div class="sub">ESP32 + BNO055 live orientation</div>
+
+  <div class="row">
+    <button id="connectBtn" class="primary">Connect ESP32</button>
+  </div>
+  <div class="status"><div id="statusDot" class="dot"></div><span id="statusText">Not connected</span></div>
+  <div id="warn">Web Serial isn't available in this browser. Open this file in desktop Chrome or Edge. Demo mode still works.</div>
+
+  <div class="row">
+    <button id="zeroBtn">Zero (Z)</button>
+    <button id="demoBtn">Demo</button>
+    <button id="viewBtn">Reset view</button>
+  </div>
+
+  <label for="mountSel">Sensor mounting (which board axis points to the car's front)</label>
+  <select id="mountSel">
+    <option value="0">+Y forward (default)</option>
+    <option value="90">+X forward</option>
+    <option value="180">-Y forward</option>
+    <option value="270">-X forward</option>
+  </select>
+
+  <hr>
+
+  <label for="colorPick">Frame color</label>
+  <input id="colorPick" type="color" value="#ff5f05">
+
+  <label for="modelFile">Load your car model (.glb, .stl, .obj)</label>
+  <input id="modelFile" type="file" accept=".glb,.gltf,.stl,.obj">
+
+  <label for="axisSel">Model up-axis</label>
+  <select id="axisSel">
+    <option value="y">Y-up (GLB / OBJ usually)</option>
+    <option value="z">Z-up (many CAD STL exports)</option>
+  </select>
+  <div class="row">
+    <button id="turnBtn">Turn model 90°</button>
+    <button id="builtinBtn">Built-in car</button>
+  </div>
+  <div class="note">Close the Arduino Serial Monitor/Plotter before connecting. The port can only be open in one place.</div>
+</div>
+
+<div id="hud" class="panel">
+  <div class="metric"><span class="k">Roll</span><span class="v" id="vRoll">0.0<small>°</small></span></div>
+  <div class="metric"><span class="k">Pitch</span><span class="v" id="vPitch">0.0<small>°</small></span></div>
+  <div class="metric"><span class="k">Steer</span><span class="v" id="vSteer">0.0<small>°</small></span></div>
+  <div class="metric"><span class="k">Rate</span><span class="v" id="vRate">0<small> Hz</small></span></div>
+  <div class="metric"><span class="k">Calib (sys)</span><span class="cal" id="vCal"><i></i><i></i><i></i></span></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+
+// ---------------- Scene ----------------
+const container = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.05, 200);
+const HOME_CAM = new THREE.Vector3(3.2, 2.2, 3.6);
+camera.position.copy(HOME_CAM);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.6, 0);
+controls.enableDamping = true;
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xdde8ff, 0x1a2233, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(4, 7, 3);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -4; sun.shadow.camera.right = 4;
+sun.shadow.camera.top = 4; sun.shadow.camera.bottom = -4;
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(6, 64),
+  new THREE.ShadowMaterial({ opacity: 0.35 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -0.3;
+ground.receiveShadow = true;
+scene.add(ground);
+const grid = new THREE.GridHelper(12, 24, 0x4a6080, 0x2a3a55);
+grid.position.y = -0.3;
+scene.add(grid);
+
+// Pivot = the point the car rotates about; car hangs below it
+const pivot = new THREE.Group();
+pivot.position.y = 0.6;
+scene.add(pivot);
+const car = new THREE.Group();
+car.position.y = -0.6;
+pivot.add(car);
+
+// World axes hint (fixed)
+const axes = new THREE.AxesHelper(0.5);
+axes.position.set(-2.2, -0.29, 2.2);
+scene.add(axes);
+
+// ---------------- Built-in Baja car ----------------
+const frameMat = new THREE.MeshStandardMaterial({ color: 0xff5f05, metalness: 0.4, roughness: 0.45 });
+const blueMat  = new THREE.MeshStandardMaterial({ color: 0x13294b, roughness: 0.7 });
+const darkMat  = new THREE.MeshStandardMaterial({ color: 0x24282e, metalness: 0.3, roughness: 0.6 });
+const greyMat  = new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.7, roughness: 0.35 });
+const tireMat  = new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 0.95 });
+const shockMat = new THREE.MeshStandardMaterial({ color: 0xd8b02a, metalness: 0.5, roughness: 0.4 });
+
+function tube(a, b, r, mat) {
+  const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b);
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, A.distanceTo(B), 10), mat);
+  m.position.copy(A).add(B).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), B.clone().sub(A).normalize());
+  m.castShadow = true;
+  return m;
+}
+const mx = p => [-p[0], p[1], p[2]];
+
+function box(w, h, d, mat, x, y, z) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  m.castShadow = true;
+  return m;
+}
+
+function makeWheel(r, w) {
+  const g = new THREE.Group();
+  const tire = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.9, r * 0.9, w, 28), tireMat);
+  tire.geometry.rotateZ(Math.PI / 2);
+  tire.castShadow = true;
+  g.add(tire);
+  const hub = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.45, r * 0.45, w + 0.02, 20), greyMat);
+  hub.geometry.rotateZ(Math.PI / 2);
+  g.add(hub);
+  const knobs = 20;
+  for (let i = 0; i < knobs; i++) {
+    const a = (i / knobs) * Math.PI * 2;
+    const k = new THREE.Mesh(new THREE.BoxGeometry(w * 0.42, r * 0.16, r * 0.2), tireMat);
+    k.position.set((i % 2 ? 1 : -1) * w * 0.22, Math.sin(a) * r * 0.95, Math.cos(a) * r * 0.95);
+    k.rotation.x = -a;
+    k.castShadow = true;
+    g.add(k);
+  }
+  return g;
+}
+
+function buildBaja() {
+  const g = new THREE.Group();
+  const R = 0.022;
+
+  // Key frame nodes (right side; mirrored for left). Forward = -Z, up = +Y
+  const F0 = [0.25, 0.22, -1.0];   // front floor corner
+  const F1 = [0.40, 0.22, -0.2];   // floor mid
+  const F2 = [0.40, 0.22, 0.80];   // floor rear
+  const H0 = [0.40, 0.22, 0.25];   // roll hoop base
+  const H1 = [0.36, 1.30, 0.30];   // roll hoop top
+  const R1 = [0.30, 1.22, -0.20];  // roof front
+  const FB = [0.30, 0.62, -0.70];  // front bracing joint
+  const S0 = [0.40, 0.62, 0.25];   // side impact rear
+  const SM = [0.365, 0.62, -0.20]; // side impact mid
+  const RR = [0.36, 0.60, 0.85];   // rear upper
+
+  const sidePairs = [
+    [F0, F1], [F1, F2], [H0, H1], [H1, R1], [R1, FB], [FB, F0],
+    [S0, FB], [F1, SM], [H1, RR], [RR, F2], [S0, RR]
+  ];
+  for (const [a, b] of sidePairs) {
+    g.add(tube(a, b, R, frameMat));
+    g.add(tube(mx(a), mx(b), R, frameMat));
+  }
+  for (const p of [F0, F2, H1, R1, FB, RR, H0, S0]) g.add(tube(mx(p), p, R, frameMat));
+  g.add(tube(mx(H0), H1, R * 0.9, frameMat)); // hoop diagonal
+
+  // Floor pan, seat, engine, CVT cover
+  g.add(box(0.6, 0.02, 1.6, darkMat, 0, 0.21, -0.12));
+  g.add(box(0.46, 0.08, 0.45, blueMat, 0, 0.30, -0.02));
+  const back = box(0.46, 0.55, 0.08, blueMat, 0, 0.58, 0.20);
+  back.rotation.x = -0.15;
+  g.add(back);
+  g.add(box(0.40, 0.32, 0.35, greyMat, 0.03, 0.42, 0.60));
+  g.add(box(0.18, 0.22, 0.18, greyMat, 0.12, 0.66, 0.60));
+  g.add(box(0.06, 0.36, 0.48, darkMat, -0.24, 0.42, 0.60)); // CVT cover
+
+  // Steering column + wheel
+  const colA = [0, 0.45, -0.78], colB = [0, 0.85, -0.38];
+  g.add(tube(colA, colB, 0.015, greyMat));
+  const sw = new THREE.Group();
+  sw.add(new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.02, 10, 32), darkMat));
+  for (let i = 0; i < 3; i++) {
+    const a = (i / 3) * Math.PI * 2 + Math.PI / 2;
+    const s = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.02, 0.015), greyMat);
+    s.position.set(Math.cos(a) * 0.075, Math.sin(a) * 0.075, 0);
+    s.rotation.z = a;
+    sw.add(s);
+  }
+  sw.position.set(...colB);
+  sw.quaternion.setFromUnitVectors(
+    new THREE.Vector3(0, 0, 1),
+    new THREE.Vector3(colB[0] - colA[0], colB[1] - colA[1], colB[2] - colA[2]).normalize().negate()
+  );
+  g.add(sw);
+
+  // Suspension
+  for (const s of [1, -1]) {
+    const P = p => [p[0] * s, p[1], p[2]];
+    g.add(tube(P([0.28, 0.48, -0.70]), P([0.60, 0.38, -0.78]), 0.014, frameMat));
+    g.add(tube(P([0.28, 0.48, -0.86]), P([0.60, 0.38, -0.78]), 0.014, frameMat));
+    g.add(tube(P([0.26, 0.26, -0.68]), P([0.60, 0.24, -0.78]), 0.014, frameMat));
+    g.add(tube(P([0.26, 0.26, -0.88]), P([0.60, 0.24, -0.78]), 0.014, frameMat));
+    g.add(tube(P([0.30, 0.82, -0.72]), P([0.55, 0.30, -0.78]), 0.03, shockMat));
+    g.add(tube(P([0.40, 0.30, 0.25]), P([0.62, 0.30, 0.75]), 0.02, frameMat));
+    g.add(tube(P([0.38, 0.95, 0.55]), P([0.60, 0.40, 0.72]), 0.03, shockMat));
+  }
+
+  // Wheels
+  const r = 0.3, w = 0.24;
+  for (const [x, z] of [[0.72, -0.78], [-0.72, -0.78], [0.72, 0.75], [-0.72, 0.75]]) {
+    const wh = makeWheel(r, w);
+    wh.position.set(x, r, z);
+    g.add(wh);
+  }
+
+  // Whip flag
+  g.add(tube([0.30, 1.28, 0.78], [0.30, 2.05, 0.86], 0.006, greyMat));
+  const flagShape = new THREE.Shape();
+  flagShape.moveTo(0, 0); flagShape.lineTo(0.28, -0.08); flagShape.lineTo(0, -0.16); flagShape.lineTo(0, 0);
+  const flag = new THREE.Mesh(new THREE.ShapeGeometry(flagShape),
+    new THREE.MeshStandardMaterial({ color: 0xff5f05, side: THREE.DoubleSide }));
+  flag.position.set(0.30, 2.04, 0.86);
+  flag.rotation.y = Math.PI / 2;
+  g.add(flag);
+
+  // Front marker so "forward" is obvious
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.06, 0.16, 16),
+    new THREE.MeshStandardMaterial({ color: 0x3ccf7a }));
+  nose.rotation.x = -Math.PI / 2;
+  nose.position.set(0, 0.28, -1.1);
+  g.add(nose);
+
+  return g;
+}
+
+const builtin = buildBaja();
+car.add(builtin);
+const custom = new THREE.Group();
+car.add(custom);
+
+// ---------------- Custom model loading ----------------
+let customObj = null;
+let modelYaw = 0;
+
+function fitCustom() {
+  if (!customObj) return;
+  customObj.position.set(0, 0, 0);
+  customObj.scale.setScalar(1);
+  customObj.rotation.set(document.getElementById('axisSel').value === 'z' ? -Math.PI / 2 : 0, 0, 0);
+  custom.rotation.set(0, modelYaw, 0);
+  customObj.updateMatrixWorld(true);
+
+  const b = new THREE.Box3().setFromObject(customObj);
+  const size = b.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const s = 2.3 / maxDim;
+  customObj.scale.setScalar(s);
+  customObj.updateMatrixWorld(true);
+
+  const b2 = new THREE.Box3().setFromObject(customObj);
+  const c = b2.getCenter(new THREE.Vector3());
+  customObj.position.set(-c.x, -b2.min.y, -c.z);
+}
+
+async function loadModel(file) {
+  const name = file.name.toLowerCase();
+  const url = URL.createObjectURL(file);
+  setStatus('wait', 'Loading ' + file.name + '…');
+  try {
+    let obj;
+    if (name.endsWith('.glb') || name.endsWith('.gltf')) {
+      obj = (await new GLTFLoader().loadAsync(url)).scene;
+    } else if (name.endsWith('.stl')) {
+      const geo = await new STLLoader().loadAsync(url);
+      geo.computeVertexNormals();
+      obj = new THREE.Mesh(geo, frameMat);
+    } else if (name.endsWith('.obj')) {
+      obj = await new OBJLoader().loadAsync(url);
+      obj.traverse(o => { if (o.isMesh) o.material = frameMat; });
+    } else {
+      throw new Error('Unsupported file type');
+    }
+    obj.traverse(o => { if (o.isMesh) { o.castShadow = true; } });
+    custom.clear();
+    customObj = obj;
+    custom.add(obj);
+    modelYaw = 0;
+    fitCustom();
+    builtin.visible = false;
+    custom.visible = true;
+    setStatus(connected ? 'ok' : (demo ? 'ok' : 'bad'), 'Loaded ' + file.name);
+  } catch (e) {
+    console.error(e);
+    setStatus('bad', 'Could not load model: ' + e.message);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+// ---------------- Orientation handling ----------------
+// BNO055 body axes: X right, Y forward, Z up.  three.js: X right, Y up, -Z forward.
+// Basis change (x, y, z) -> (x, z, -y)
+function sensorToThree(w, x, y, z) {
+  return new THREE.Quaternion(x, z, -y, w).normalize();
+}
+
+const qRaw = new THREE.Quaternion();
+const qZero = new THREE.Quaternion();
+const qTarget = new THREE.Quaternion();
+const qShown = new THREE.Quaternion();
+let haveZero = false;
+let packets = 0, packetsSec = 0, lastPacketT = 0;
+
+function mountQuat() {
+  const deg = parseFloat(document.getElementById('mountSel').value);
+  return new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(deg));
+}
+
+function updateTarget() {
+  const rel = qZero.clone().invert().multiply(qRaw);
+  const m = mountQuat();
+  qTarget.copy(m).multiply(rel).multiply(m.clone().invert());
+}
+
+function zero() {
+  qZero.copy(qRaw);
+  haveZero = true;
+  updateTarget();
+  sendCmd('z');
+}
+
+// ---------------- HUD ----------------
+const el = id => document.getElementById(id);
+function setHud(roll, pitch, steer, cal) {
+  el('vRoll').innerHTML = roll.toFixed(1) + '<small>°</small>';
+  el('vPitch').innerHTML = pitch.toFixed(1) + '<small>°</small>';
+  el('vSteer').innerHTML = steer.toFixed(1) + '<small>°</small>';
+  const bars = el('vCal').children;
+  for (let i = 0; i < 3; i++) bars[i].classList.toggle('f', i < cal);
+}
+function setStatus(kind, text) {
+  el('statusDot').className = 'dot' + (kind === 'ok' ? ' ok' : kind === 'wait' ? ' wait' : '');
+  el('statusText').textContent = text;
+}
+setInterval(() => {
+  packetsSec = packets;
+  packets = 0;
+  el('vRate').innerHTML = packetsSec + '<small> Hz</small>';
+  if (connected && performance.now() - lastPacketT > 1500) setStatus('wait', 'Connected, waiting for data…');
+}, 1000);
+
+// ---------------- Web Serial ----------------
+let port = null, reader = null, writer = null, readClosed = null;
+let connected = false, pokeTimer = null, gotFirst = 0;
+const enc = new TextEncoder();
+
+async function sendCmd(c) {
+  if (!writer) return;
+  try { await writer.write(enc.encode(c + '\n')); } catch (e) { /* ignore */ }
+}
+
+function handleLine(line) {
+  if (!line.startsWith('Q,')) return;
+  const p = line.split(',');
+  if (p.length < 9) return;
+  const v = p.slice(1).map(Number);
+  if (v.some(Number.isNaN)) return;
+  const [w, x, y, z, roll, pitch, steer, cal] = v;
+  if (w * w + x * x + y * y + z * z < 0.5) return;
+
+  qRaw.copy(sensorToThree(w, x, y, z));
+  packets++;
+  gotFirst++;
+  lastPacketT = performance.now();
+  if (!haveZero && gotFirst > 25) zero();
+  if (haveZero) updateTarget();
+  setHud(roll, pitch, steer, cal);
+  setStatus('ok', 'Streaming from ESP32');
+}
+
+async function connect() {
+  if (connected) { await disconnect(); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+  } catch (e) {
+    setStatus('bad', 'Connection cancelled or port busy');
+    return;
+  }
+  connected = true;
+  demo = false;
+  el('demoBtn').classList.remove('on');
+  el('connectBtn').textContent = 'Disconnect';
+  setStatus('wait', 'Connected, waiting for data…');
+  haveZero = false;
+  gotFirst = 0;
+
+  writer = port.writable.getWriter();
+  pokeTimer = setInterval(() => {
+    if (performance.now() - lastPacketT > 1000) sendCmd('v');
+  }, 700);
+
+  const decoder = new TextDecoderStream();
+  readClosed = port.readable.pipeTo(decoder.writable).catch(() => {});
+  reader = decoder.readable.getReader();
+  let buf = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        handleLine(buf.slice(0, i).trim());
+        buf = buf.slice(i + 1);
+      }
+      if (buf.length > 4096) buf = '';
+    }
+  } catch (e) {
+    console.warn(e);
+  }
+  if (connected) await disconnect();
+}
+
+async function disconnect() {
+  connected = false;
+  clearInterval(pokeTimer);
+  try { await sendCmd('p'); } catch (e) {}
+  try { await reader?.cancel(); } catch (e) {}
+  try { await readClosed; } catch (e) {}
+  try { writer?.releaseLock(); } catch (e) {}
+  try { await port?.close(); } catch (e) {}
+  reader = writer = port = null;
+  el('connectBtn').textContent = 'Connect ESP32';
+  setStatus('bad', 'Disconnected');
+}
+
+// ---------------- Demo mode ----------------
+let demo = false;
+function demoStep(t) {
+  const roll = 18 * Math.sin(t * 0.9);
+  const pitch = 10 * Math.sin(t * 0.6 + 1);
+  const yaw = 35 * Math.sin(t * 0.25);
+  const e = new THREE.Euler(
+    THREE.MathUtils.degToRad(pitch),
+    THREE.MathUtils.degToRad(-yaw),
+    THREE.MathUtils.degToRad(-roll),
+    'YXZ'
+  );
+  qTarget.setFromEuler(e);
+  packets++;
+  setHud(roll, pitch, yaw, 3);
+}
+
+// ---------------- UI wiring ----------------
+if (!('serial' in navigator)) {
+  el('warn').style.display = 'block';
+  el('connectBtn').disabled = true;
+  el('connectBtn').style.opacity = 0.5;
+}
+el('connectBtn').onclick = connect;
+el('zeroBtn').onclick = () => { if (demo) qTarget.identity(); else zero(); };
+el('demoBtn').onclick = () => {
+  if (connected) return;
+  demo = !demo;
+  el('demoBtn').classList.toggle('on', demo);
+  setStatus(demo ? 'ok' : 'bad', demo ? 'Demo motion' : 'Not connected');
+  if (!demo) { qTarget.identity(); setHud(0, 0, 0, 0); }
+};
+el('viewBtn').onclick = () => { camera.position.copy(HOME_CAM); controls.target.set(0, 0.6, 0); controls.update(); };
+el('mountSel').onchange = () => { if (haveZero) updateTarget(); };
+el('colorPick').oninput = e => frameMat.color.set(e.target.value);
+el('modelFile').onchange = e => { const f = e.target.files[0]; if (f) loadModel(f); };
+el('axisSel').onchange = fitCustom;
+el('turnBtn').onclick = () => { modelYaw += Math.PI / 2; fitCustom(); };
+el('builtinBtn').onclick = () => { builtin.visible = true; custom.visible = false; };
+window.addEventListener('keydown', e => { if (e.key === 'z' || e.key === 'Z') el('zeroBtn').click(); });
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------------- Render loop ----------------
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+  if (demo) demoStep(t);
+  qShown.slerp(qTarget, 0.35);
+  pivot.quaternion.copy(qShown);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
